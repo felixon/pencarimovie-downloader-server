@@ -1,22 +1,19 @@
 {
-    # FrankenPHP configuration for long-running Telegram video streams.
-    # Keep enough PHP threads available so active streams do not block
-    # normal dashboard/catalog requests or additional streams.
+    # FrankenPHP classic-mode tuning for long-running Telegram streams.
+    # Keep spare PHP threads available so active video streams do not block
+    # dashboard/catalog requests or a second stream.
     frankenphp {
-        num_threads 8
-        max_threads 12
-        max_wait_time 10s
+        num_threads 6
+        max_threads 8
         {$FRANKENPHP_CONFIG}
     }
 
     # Video streaming writes the response while the request remains open.
-    # Full-duplex HTTP/1 support prevents the HTTP connection from becoming
-    # a bottleneck for long-lived browser streams.
+    # Allow the HTTP/1 connection to read/write concurrently.
     servers {
         enable_full_duplex
     }
 
-    # Allow extra global Caddy options supplied by the environment.
     {$CADDY_GLOBAL_OPTIONS}
 
     skip_install_trust
