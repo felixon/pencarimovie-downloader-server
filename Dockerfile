@@ -22,6 +22,12 @@ RUN printf '%s\n' \
     'memory_limit = 512M' \
     > /usr/local/etc/php/conf.d/pencarimovie.ini
 
+# Render's Docker runtime does not allow binaries that carry Linux file
+# capabilities. FrankenPHP inherits Caddy's capability used for privileged
+# ports, so remove it before the image is deployed. We listen on Render's
+# unprivileged PORT, so the capability is unnecessary.
+RUN setcap -r /usr/local/bin/frankenphp || true
+
 # Render supplies PORT at runtime. The explicit command avoids relying on
 # the image's default Caddy configuration/port.
 ENV SERVER_NAME=:8080
