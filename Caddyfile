@@ -1,42 +1,37 @@
-{ # FrankenPHP uses Caddy under the hood. # This Caddyfile is based on the official FrankenPHP template: # https://github.com/php/frankenphp/blob/main/caddy/frankenphp/Caddyfile
+{
+    # FrankenPHP configuration for long-running Telegram video streams.
+    # Keep enough PHP threads available so active streams do not block
+    # normal dashboard/catalog requests or additional streams.
+    frankenphp {
+        num_threads 8
+        max_threads 12
+        max_wait_time 10s
+        {$FRANKENPHP_CONFIG}
+    }
 
-    # Skip automatic HTTPS certificate install for local dev
-    skip_install_trust
+    # Video streaming writes the response while the request remains open.
+    # Full-duplex HTTP/1 support prevents the HTTP connection from becoming
+    # a bottleneck for long-lived browser streams.
+    servers {
+        enable_full_duplex
+    }
 
-    # Inject extra global options via environment variable
+    # Allow extra global Caddy options supplied by the environment.
     {$CADDY_GLOBAL_OPTIONS}
 
-    # FrankenPHP-specific configuration
-    frankenphp {
-    	# PHP ini directives can be set here
-    	# (openssl.cafile is PHP_INI_SYSTEM — must be set in php.ini, not here)
-    	{$FRANKENPHP_CONFIG}
-    }
-
+    skip_install_trust
 }
 
-# Extra Caddy configuration via environment variable
+:8088 {
+    root * .
 
-{$CADDY_EXTRA_CONFIG}
-
-# Serve on all interfaces, port 8088, HTTP only (no TLS for local dev)
-
-:8088 { # Serve from the embedded/current directory
-root \* .
-
-    # Enable compression
     encode zstd br gzip
 
-    # FrankenPHP: route requests through index.php
     php_server {
-    	index index.php
+        index index.php
     }
 
-    # Also serve static files from public/
     file_server
-
 }
 
-# Load any additional Caddyfiles dropped into Caddyfile.d/
-
-import Caddyfile.d/\*.caddyfile
+import Caddyfile.d/*.caddyfile
