@@ -1,16 +1,22 @@
+# Build Composer dependencies in the official Composer image.
+FROM composer:2 AS composer
+
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+# Runtime image.
 FROM dunglas/frankenphp:php8.3-bookworm
 
 WORKDIR /app
 
-# Install Composer dependencies during the image build.
-COPY composer.json composer.lock ./
-RUN composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
-
-# Copy the complete PHP server.
+# Copy the complete PHP server first.
 COPY . /app
 
-# Persistent runtime directories. Render's filesystem is ephemeral on Free,
-# but the application can still create its session/storage files at runtime.
+# Copy the vendor directory produced by Composer.
+COPY --from=composer /app/vendor /app/vendor
+
+# Runtime storage directories.
 RUN mkdir -p /app/storage /app/storage/stream-pool \
     && chmod -R 777 /app/storage
 
