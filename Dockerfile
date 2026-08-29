@@ -1,36 +1,36 @@
-# Build Composer dependencies in the official Composer image.
-FROM composer:2 AS composer
-
-WORKDIR /app
-COPY composer.json composer.lock ./
-RUN composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
-
-# Runtime image.
-FROM dunglas/frankenphp:php8.3-bookworm
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-COPY . /app
-COPY --from=composer /app/vendor /app/vendor
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates tar \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/storage /app/storage/stream-pool \
-    && chmod -R 777 /app/storage
+# Use the same packaged PencariMovie runtime that the working deployment uses.
+# This avoids rebuilding Composer/MadelineProto/FrankenPHP inside Render.
+RUN curl -L \
+    "https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.0/pencarimovie-downloader-linux-x86_64.tar.gz" \
+    -o /tmp/pencarimovie.tar.gz \
+    && tar -xzf /tmp/pencarimovie.tar.gz -C /app \
+    && rm /tmp/pencarimovie.tar.gz \
+    && chmod +x /app/bin/frankenphp
 
-RUN printf '%s\n' \
-    'max_execution_time = 0' \
-    'max_input_time = 0' \
-    'memory_limit = 512M' \
-    > /usr/local/etc/php/conf.d/pencarimovie.ini
+# Long Telegram-backed streams must not be terminated by PHP's default
+# execution timeout.
+RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini; then \
+        sed -Ei 's/^[;[:space:]]*max_execution_time[[:space:]]*=.*/max_execution_time = 0/' /app/bin/php.ini; \
+    else \
+        printf '\nmax_execution_time = 0\n' >> /app/bin/php.ini; \
+    fi
 
-# Render's Docker runtime does not allow binaries that carry Linux file
-# capabilities. FrankenPHP inherits Caddy's capability used for privileged
-# ports, so remove it before the image is deployed. We listen on Render's
-# unprivileged PORT, so the capability is unnecessary.
-RUN setcap -r /usr/local/bin/frankenphp || true
+# Render provides the real bot token through PENCARIMOVIE_BOT_TOKEN.
+# The browser may still submit a token, but the hosted server-side token is
+# authoritative. The secret is never written into the image or frontend.
+RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\        \$configuredBotToken = trim((string) (\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\n        if (\$configuredBotToken !== '') {\n            \$botToken = \$configuredBotToken;\n        }" /app/backend.php
 
-# Render supplies PORT at runtime. The explicit command avoids relying on
-# the image's default Caddy configuration/port.
-ENV SERVER_NAME=:8080
-EXPOSE 8080
+# Keep the packaged storage location explicit for Render.
+ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
-CMD ["sh", "-c", "frankenphp php-server --listen 0.0.0.0:${PORT:-8080} --root /app"]
+EXPOSE 10000
+
+CMD ["/bin/sh", "-c", "exec /app/bin/frankenphp php-server --listen 0.0.0.0:${PORT:-10000} --root /app"]
