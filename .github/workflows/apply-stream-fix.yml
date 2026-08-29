@@ -21,20 +21,23 @@ jobs:
           set -euo pipefail
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           p = Path('backend.php')
           s = p.read_text()
+          if 'FD_STREAM_POOL_SIZE' in s:
+              print('Patch already present')
+              raise SystemExit(0)
 
-          needle = "define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));\n"
-          insert = needle + "define('FD_STREAM_POOL_SIZE', 2);\ndefine('FD_STREAM_POOL_DIR', fd_storage_path('storage/stream-pool'));\n"
-          assert needle in s and 'FD_STREAM_POOL_SIZE' not in s
-          s = s.replace(needle, insert, 1)
+          # Constants
+          needle = "define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));"
+          assert needle in s, 'session meta constant not found'
+          s = s.replace(needle, needle + "\ndefine('FD_STREAM_POOL_SIZE', 2);\ndefine('FD_STREAM_POOL_DIR', fd_storage_path('storage/stream-pool'));", 1)
 
-          marker = "/**\n * Boot MadelineProto using session-based auth.\n"
-          helpers = r'''/**
-           * Return the dedicated session path for a streaming pool slot.
-           * Each slot has its own MadelineProto session so a long-running download
-           * never blocks another download on the primary session file.
+          # Pool helpers
+          marker = "/**\n * Boot MadelineProto using session-based auth."
+          helpers = '''/**
+           * Dedicated MTProto session pool for concurrent video streams.
            */
           function fd_stream_pool_session_path(int $slot): string
           {
@@ -47,40 +50,24 @@ jobs:
               return FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . 'session-' . $slot . '.madeline';
           }
 
-          /**
-           * Acquire an exclusive stream slot. The lock is intentionally held for the
-           * entire HTTP stream, preventing two requests from opening the same session.
-           *
-           * @return array{slot:int,handle:resource,session:string}
-           */
           function fd_acquire_stream_slot(int $timeoutSeconds = 25): array
           {
               if (!is_dir(FD_STREAM_POOL_DIR)) {
                   @mkdir(FD_STREAM_POOL_DIR, 0777, true);
               }
-
               $deadline = microtime(true) + max(1, $timeoutSeconds);
               do {
                   for ($slot = 1; $slot <= FD_STREAM_POOL_SIZE; $slot++) {
-                      $lockPath = FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . 'slot-' . $slot . '.lock';
-                      $handle = @fopen($lockPath, 'c');
-                      if ($handle === false) {
-                          continue;
+                      $handle = @fopen(FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . 'slot-' . $slot . '.lock', 'c');
+                      if ($handle !== false && @flock($handle, LOCK_EX | LOCK_NB)) {
+                          return ['slot' => $slot, 'handle' => $handle, 'session' => fd_stream_pool_session_path($slot)];
                       }
-
-                      if (@flock($handle, LOCK_EX | LOCK_NB)) {
-                          return [
-                              'slot' => $slot,
-                              'handle' => $handle,
-                              'session' => fd_stream_pool_session_path($slot),
-                          ];
+                      if (is_resource($handle)) {
+                          @fclose($handle);
                       }
-                      @fclose($handle);
                   }
-
                   usleep(100000);
               } while (microtime(true) < $deadline);
-
               throw new RuntimeException('All streaming slots are busy. Please try again shortly.');
           }
 
@@ -93,16 +80,11 @@ jobs:
               }
           }
 
-          /**
-           * Remove the dedicated streaming session pool. This is used only during a
-           * deliberate bot login/logout, never while a stream is active.
-           */
           function fd_clear_stream_pool(): void
           {
               if (!is_dir(FD_STREAM_POOL_DIR)) {
                   return;
               }
-
               try {
                   $files = new RecursiveIteratorIterator(
                       new RecursiveDirectoryIterator(FD_STREAM_POOL_DIR, RecursiveDirectoryIterator::SKIP_DOTS),
@@ -110,14 +92,9 @@ jobs:
                   );
                   foreach ($files as $fileinfo) {
                       try {
-                          if ($fileinfo->isDir()) {
-                              @rmdir($fileinfo->getRealPath());
-                          } else {
-                              @unlink($fileinfo->getRealPath());
-                          }
-                      } catch (Throwable $e) {
-                          // A currently active stream owns this slot. Leave it intact.
-                      }
+                          if ($fileinfo->isDir()) @rmdir($fileinfo->getRealPath());
+                          else @unlink($fileinfo->getRealPath());
+                      } catch (Throwable $e) {}
                   }
                   @rmdir(FD_STREAM_POOL_DIR);
               } catch (Throwable $e) {
@@ -125,149 +102,67 @@ jobs:
               }
           }
 
-          /**
-           * Warm the streaming pool after a successful bot login.
-           * Each slot gets its own authenticated MTProto session, allowing independent
-           * HTTP requests to stream concurrently without sharing session locks.
-           */
           function fd_warm_stream_pool(string $botToken): array
           {
               $ready = 0;
               $errors = [];
-
               for ($slot = 1; $slot <= FD_STREAM_POOL_SIZE; $slot++) {
-                  $sessionPath = fd_stream_pool_session_path($slot);
                   try {
-                      [$api, $error] = fd_boot_madeline($botToken, [], $sessionPath);
+                      [$api, $error] = fd_boot_madeline($botToken, [], fd_stream_pool_session_path($slot));
                       if ($api) {
                           unset($api);
                           $ready++;
                           fd_log('stream pool slot ready', ['slot' => $slot]);
                       } else {
                           $errors[] = 'slot ' . $slot . ': ' . ($error ?: 'unknown error');
-                          fd_log('stream pool slot failed', ['slot' => $slot, 'error' => $error]);
                       }
                   } catch (Throwable $e) {
                       $errors[] = 'slot ' . $slot . ': ' . $e->getMessage();
-                      fd_log('stream pool slot exception', ['slot' => $slot, 'error' => $e->getMessage()]);
                   }
               }
-
               return ['ready' => $ready, 'errors' => $errors];
           }
 
           '''
-          assert marker in s
+          assert marker in s, 'boot marker not found'
           s = s.replace(marker, helpers + marker, 1)
 
+          # Allow fd_boot_madeline to target an independent session path.
           s = s.replace(
-              "function fd_boot_madeline(?string $botToken = null, array $overrides = []): array",
-              "function fd_boot_madeline(?string $botToken = null, array $overrides = [], ?string $sessionPathOverride = null): array",
-              1,
-          )
-          s = s.replace(
-              "$sessionPath = FD_SESSION_PATH;\n    $sessionDir = dirname($sessionPath);",
-              "$sessionPath = $sessionPathOverride ?: FD_SESSION_PATH;\n    $sessionDir = dirname($sessionPath);",
-              1,
-          )
+              'function fd_boot_madeline(?string $botToken = null, array $overrides = []): array',
+              'function fd_boot_madeline(?string $botToken = null, array $overrides = [], ?string $sessionPathOverride = null): array', 1)
+          s = s.replace('$sessionPath = FD_SESSION_PATH;', '$sessionPath = $sessionPathOverride ?: FD_SESSION_PATH;', 1)
 
-          needle = "        // Logging in with a new token — clear any existing session so\n        // fd_boot_madeline() cannot resume the old one and must call\n        // botLogin() with the newly provided token.\n        fd_clear_session();"
-          replacement = "        // Logging in with a new token — clear the primary session and the\n        // dedicated streaming pool so slots can never belong to an old bot.\n        fd_clear_stream_pool();\n        fd_clear_session();"
-          assert needle in s
-          s = s.replace(needle, replacement, 1)
+          # Clear the pool whenever the bot is deliberately re-authenticated.
+          s = s.replace('        fd_clear_session();\n\n        // ═══ [DIAGNOSTIC] Capture any stray output before fd_boot_madeline', '        fd_clear_stream_pool();\n        fd_clear_session();\n\n        // ═══ [DIAGNOSTIC] Capture any stray output before fd_boot_madeline', 1)
 
-          needle = "            fd_save_session_meta(\n                $botId,\n                (string) ($self['username'] ?? ''),\n                (string) ($self['first_name'] ?? '')\n            );\n            fd_json(["
-          replacement = "            fd_save_session_meta(\n                $botId,\n                (string) ($self['username'] ?? ''),\n                (string) ($self['first_name'] ?? '')\n            );\n\n            // Prepare independent MTProto sessions for concurrent streams.\n            $pool = fd_warm_stream_pool($botToken);\n            fd_log('stream pool warmup complete', $pool);\n\n            fd_json(["
-          assert needle in s
-          s = s.replace(needle, replacement, 1)
+          # Warm the pool after successful login.
+          login_marker = "            fd_save_session_meta(\n                $botId,\n                (string) ($self['username'] ?? ''),\n                (string) ($self['first_name'] ?? '')\n            );\n            fd_json(["
+          assert login_marker in s, 'login success marker not found'
+          s = s.replace(login_marker, "            fd_save_session_meta(\n                $botId,\n                (string) ($self['username'] ?? ''),\n                (string) ($self['first_name'] ?? '')\n            );\n\n            $pool = fd_warm_stream_pool($botToken);\n            fd_log('stream pool warmup complete', $pool);\n\n            fd_json([", 1)
 
-          needle = "        // Always clean up local files regardless of whether logout() succeeded\n        fd_clear_session();\n        fd_json(['ok' => 1, 'message' => 'Session cleared.']);"
-          replacement = "        // Always clean up local files regardless of whether logout() succeeded\n        fd_clear_stream_pool();\n        fd_clear_session();\n        fd_json(['ok' => 1, 'message' => 'Session cleared.']);"
-          assert needle in s
-          s = s.replace(needle, replacement, 1)
-
-          old = r'''        // fd_boot_madeline() handles its own output buffering internally.
-          [$madeline, $error] = fd_boot_madeline();
-
-          if (!$madeline) {
-              fd_log('download failed — no valid session', [
-                  'error' => $error,
-              ]);
-              header('Cache-Control: no-cache, no-store, must-revalidate');
-              header('Connection: close');
-              fd_json([
-                  'ok' => 0,
-                  'message' => $error ?: 'No valid MadelineProto session.',
-                  'hint' => 'Call /api/botlogin first to authenticate.',
-              ], 403);
-          }
-
-          if (!method_exists($madeline, 'downloadToBrowser')) {
-              fd_log('downloadToBrowser unavailable on madeline instance');
-              fd_json([
-                  'ok' => 0,
-                  'message' => 'MadelineProto downloadToBrowser() is not available.',
-              ], 501);
-          }
-
-          try {
-              fd_log('starting downloadToBrowser', [
-                  'file_id' => $fileId,
-                  'file_size' => $fileSize,
-                  'file_name' => $fileName,
-                  'mime' => $fileMime,
-              ]);
-              $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
-          } catch (Throwable $throwable) {
-              fd_log('downloadToBrowser failed', [
-                  'error' => $throwable->getMessage(),
-              ]);
-              fd_json([
-                  'ok' => 0,
-                  'message' => 'File download failed.',
-              ], 500);
-          }
-
-          return true;'''
-          new = r'''        // Allocate a dedicated MTProto session for the lifetime of this stream.
-          // The primary session is no longer used for long-running video transfers.
+          # Replace the download boot/stream section using stable markers.
+          start = s.index('        // fd_boot_madeline() handles its own output buffering internally.', s.index("if ($path === '/api/download'"))
+          end = s.index('        return true;', start) + len('        return true;')
+          replacement = '''        // Use an independent session for every active stream.
           try {
               $streamSlot = fd_acquire_stream_slot();
           } catch (Throwable $slotError) {
               fd_log('no streaming slot available', ['error' => $slotError->getMessage()]);
               header('Retry-After: 3');
-              fd_json([
-                  'ok' => 0,
-                  'message' => 'All streaming slots are currently busy. Please try again shortly.',
-              ], 503);
+              fd_json(['ok' => 0, 'message' => 'All streaming slots are currently busy. Please try again shortly.'], 503);
           }
 
           $madeline = null;
           try {
-              // Boot the slot-specific session. Each slot is independently
-              // authenticated, so it cannot block another active stream.
               [$madeline, $error] = fd_boot_madeline(null, [], $streamSlot['session']);
-
               if (!$madeline) {
-                  fd_log('download failed — stream session unavailable', [
-                      'slot' => $streamSlot['slot'],
-                      'error' => $error,
-                  ]);
-                  header('Cache-Control: no-cache, no-store, must-revalidate');
-                  header('Connection: close');
-                  fd_json([
-                      'ok' => 0,
-                      'message' => $error ?: 'Streaming session is not initialized. Please reconnect the bot.',
-                      'hint' => 'Reconnect your bot in dashboard settings to initialize streaming sessions.',
-                  ], 503);
+                  fd_log('stream session unavailable', ['slot' => $streamSlot['slot'], 'error' => $error]);
+                  fd_json(['ok' => 0, 'message' => $error ?: 'Streaming session is not initialized. Please reconnect the bot.'], 503);
               }
 
               if (!method_exists($madeline, 'downloadToBrowser')) {
-                  fd_log('downloadToBrowser unavailable on madeline instance', ['slot' => $streamSlot['slot']]);
-                  fd_json([
-                      'ok' => 0,
-                      'message' => 'MadelineProto downloadToBrowser() is not available.',
-                  ], 501);
+                  fd_json(['ok' => 0, 'message' => 'MadelineProto downloadToBrowser() is not available.'], 501);
               }
 
               fd_log('starting concurrent downloadToBrowser', [
@@ -277,35 +172,23 @@ jobs:
                   'file_name' => $fileName,
                   'mime' => $fileMime,
               ]);
-
               $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
               return true;
           } catch (Throwable $throwable) {
-              fd_log('downloadToBrowser failed', [
-                  'slot' => $streamSlot['slot'],
-                  'error' => $throwable->getMessage(),
-              ]);
+              fd_log('downloadToBrowser failed', ['slot' => $streamSlot['slot'], 'error' => $throwable->getMessage()]);
               if (!headers_sent()) {
-                  fd_json([
-                      'ok' => 0,
-                      'message' => 'File download failed.',
-                  ], 500);
+                  fd_json(['ok' => 0, 'message' => 'File download failed.'], 500);
               }
               return true;
           } finally {
-              // Destroy the Madeline instance before releasing the slot. This
-              // prevents its shutdown serialization from racing the next request.
               unset($madeline);
               fd_release_stream_slot($streamSlot);
           }'''
-          assert old in s
-          s = s.replace(old, new, 1)
+          s = s[:start] + replacement + s[end:]
 
           p.write_text(s)
           PY
-
           php -l backend.php
-          test -f backend.php
 
       - name: Commit patch and remove one-time workflow
         run: |
