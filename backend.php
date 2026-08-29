@@ -135,6 +135,8 @@ define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
 define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));
+define('FD_STREAM_POOL_SIZE', 2);
+define('FD_STREAM_POOL_DIR', fd_storage_path('storage/stream-pool'));
 
 /**
  * Optional DNS resolution mapping for curl (e.g. "example.com:443:1.2.3.4").
@@ -745,6 +747,93 @@ function fd_save_cached_api_credentials(int $apiId, string $apiHash): void
 }
 
 /**
+ * Dedicated MTProto session pool for concurrent video streams.
+ */
+function fd_stream_pool_session_path(int $slot): string
+{
+    if ($slot < 1 || $slot > FD_STREAM_POOL_SIZE) {
+        throw new InvalidArgumentException('Invalid stream pool slot.');
+    }
+    if (!is_dir(FD_STREAM_POOL_DIR)) {
+        @mkdir(FD_STREAM_POOL_DIR, 0777, true);
+    }
+    return FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . 'session-' . $slot . '.madeline';
+}
+
+function fd_acquire_stream_slot(int $timeoutSeconds = 25): array
+{
+    if (!is_dir(FD_STREAM_POOL_DIR)) {
+        @mkdir(FD_STREAM_POOL_DIR, 0777, true);
+    }
+    $deadline = microtime(true) + max(1, $timeoutSeconds);
+    do {
+        for ($slot = 1; $slot <= FD_STREAM_POOL_SIZE; $slot++) {
+            $handle = @fopen(FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . 'slot-' . $slot . '.lock', 'c');
+            if ($handle !== false && @flock($handle, LOCK_EX | LOCK_NB)) {
+                return ['slot' => $slot, 'handle' => $handle, 'session' => fd_stream_pool_session_path($slot)];
+            }
+            if (is_resource($handle)) {
+                @fclose($handle);
+            }
+        }
+        usleep(100000);
+    } while (microtime(true) < $deadline);
+    throw new RuntimeException('All streaming slots are busy. Please try again shortly.');
+}
+
+function fd_release_stream_slot(array $slot): void
+{
+    $handle = $slot['handle'] ?? null;
+    if (is_resource($handle)) {
+        @flock($handle, LOCK_UN);
+        @fclose($handle);
+    }
+}
+
+function fd_clear_stream_pool(): void
+{
+    if (!is_dir(FD_STREAM_POOL_DIR)) {
+        return;
+    }
+    try {
+        $files = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator(FD_STREAM_POOL_DIR, RecursiveDirectoryIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST
+        );
+        foreach ($files as $fileinfo) {
+            try {
+                if ($fileinfo->isDir()) @rmdir($fileinfo->getRealPath());
+                else @unlink($fileinfo->getRealPath());
+            } catch (Throwable $e) {}
+        }
+        @rmdir(FD_STREAM_POOL_DIR);
+    } catch (Throwable $e) {
+        fd_log('stream pool cleanup skipped', ['error' => $e->getMessage()]);
+    }
+}
+
+function fd_warm_stream_pool(string $botToken): array
+{
+    $ready = 0;
+    $errors = [];
+    for ($slot = 1; $slot <= FD_STREAM_POOL_SIZE; $slot++) {
+        try {
+            [$api, $error] = fd_boot_madeline($botToken, [], fd_stream_pool_session_path($slot));
+            if ($api) {
+                unset($api);
+                $ready++;
+                fd_log('stream pool slot ready', ['slot' => $slot]);
+            } else {
+                $errors[] = 'slot ' . $slot . ': ' . ($error ?: 'unknown error');
+            }
+        } catch (Throwable $e) {
+            $errors[] = 'slot ' . $slot . ': ' . $e->getMessage();
+        }
+    }
+    return ['ready' => $ready, 'errors' => $errors];
+}
+
+/**
  * Boot MadelineProto using session-based auth.
  *
  * - If a session file exists and is valid, returns the instance directly.
@@ -763,7 +852,7 @@ function fd_save_cached_api_credentials(int $apiId, string $apiHash): void
  * @param array       $overrides Optional api_id/api_hash overrides (emergency only).
  * @return array [MadelineProto|null, string|null error]
  */
-function fd_boot_madeline(?string $botToken = null, array $overrides = []): array
+function fd_boot_madeline(?string $botToken = null, array $overrides = [], ?string $sessionPathOverride = null): array
 {
     // ── Suppress direct echo from polyfill.php ──────────────────────────────
     // polyfill.php is loaded as a Composer autoload file (autoload_files.php),
@@ -841,7 +930,7 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = []): arra
         return [null, 'No API credentials available. Login via the settings page to fetch from WordPress.'];
     }
 
-    $sessionPath = FD_SESSION_PATH;
+    $sessionPath = $sessionPathOverride ?: FD_SESSION_PATH;
     $sessionDir = dirname($sessionPath);
 
     if (!is_dir($sessionDir)) {
@@ -3687,6 +3776,7 @@ if (str_starts_with($path, '/api/')) {
         // Logging in with a new token — clear any existing session so
         // fd_boot_madeline() cannot resume the old one and must call
         // botLogin() with the newly provided token.
+        fd_clear_stream_pool();
         fd_clear_session();
 
         // ═══ [DIAGNOSTIC] Capture any stray output before fd_boot_madeline ═══
@@ -3764,6 +3854,10 @@ if (str_starts_with($path, '/api/')) {
                 (string) ($self['username'] ?? ''),
                 (string) ($self['first_name'] ?? '')
             );
+
+            $pool = fd_warm_stream_pool($botToken);
+            fd_log('stream pool warmup complete', $pool);
+
             fd_json([
                 'ok' => 1,
                 'bot_id' => $botId,
@@ -3953,49 +4047,46 @@ if (str_starts_with($path, '/api/')) {
             ], 400);
         }
 
-        // fd_boot_madeline() handles its own output buffering internally.
-        [$madeline, $error] = fd_boot_madeline();
+        // Use an independent session for every active stream.
+try {
+    $streamSlot = fd_acquire_stream_slot();
+} catch (Throwable $slotError) {
+    fd_log('no streaming slot available', ['error' => $slotError->getMessage()]);
+    header('Retry-After: 3');
+    fd_json(['ok' => 0, 'message' => 'All streaming slots are currently busy. Please try again shortly.'], 503);
+}
 
-        if (!$madeline) {
-            fd_log('download failed — no valid session', [
-                'error' => $error,
-            ]);
-            header('Cache-Control: no-cache, no-store, must-revalidate');
-            header('Connection: close');
-            fd_json([
-                'ok' => 0,
-                'message' => $error ?: 'No valid MadelineProto session.',
-                'hint' => 'Call /api/botlogin first to authenticate.',
-            ], 403);
-        }
+$madeline = null;
+try {
+    [$madeline, $error] = fd_boot_madeline(null, [], $streamSlot['session']);
+    if (!$madeline) {
+        fd_log('stream session unavailable', ['slot' => $streamSlot['slot'], 'error' => $error]);
+        fd_json(['ok' => 0, 'message' => $error ?: 'Streaming session is not initialized. Please reconnect the bot.'], 503);
+    }
 
-        if (!method_exists($madeline, 'downloadToBrowser')) {
-            fd_log('downloadToBrowser unavailable on madeline instance');
-            fd_json([
-                'ok' => 0,
-                'message' => 'MadelineProto downloadToBrowser() is not available.',
-            ], 501);
-        }
+    if (!method_exists($madeline, 'downloadToBrowser')) {
+        fd_json(['ok' => 0, 'message' => 'MadelineProto downloadToBrowser() is not available.'], 501);
+    }
 
-        try {
-            fd_log('starting downloadToBrowser', [
-                'file_id' => $fileId,
-                'file_size' => $fileSize,
-                'file_name' => $fileName,
-                'mime' => $fileMime,
-            ]);
-            $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
-        } catch (Throwable $throwable) {
-            fd_log('downloadToBrowser failed', [
-                'error' => $throwable->getMessage(),
-            ]);
-            fd_json([
-                'ok' => 0,
-                'message' => 'File download failed.',
-            ], 500);
-        }
-
-        return true;
+    fd_log('starting concurrent downloadToBrowser', [
+        'slot' => $streamSlot['slot'],
+        'file_id' => $fileId,
+        'file_size' => $fileSize,
+        'file_name' => $fileName,
+        'mime' => $fileMime,
+    ]);
+    $madeline->downloadToBrowser($fileId, null, $fileSize, $fileName, $fileMime);
+    return true;
+} catch (Throwable $throwable) {
+    fd_log('downloadToBrowser failed', ['slot' => $streamSlot['slot'], 'error' => $throwable->getMessage()]);
+    if (!headers_sent()) {
+        fd_json(['ok' => 0, 'message' => 'File download failed.'], 500);
+    }
+    return true;
+} finally {
+    unset($madeline);
+    fd_release_stream_slot($streamSlot);
+}
     }
 
     fd_json(['ok' => 0, 'message' => 'Unknown API endpoint'], 404);
