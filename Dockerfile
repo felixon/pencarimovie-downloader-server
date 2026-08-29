@@ -6,10 +6,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Use the same packaged PencariMovie runtime that the working deployment uses.
-# This avoids rebuilding Composer/MadelineProto/FrankenPHP inside Render.
-RUN curl -L \
-    "https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.0/pencarimovie-downloader-linux-x86_64.tar.gz" \
+# Use the same packaged PencariMovie runtime as the known-working deployment.
+# v1.0.1 is the current published release; v1.0.0 does not exist.
+RUN curl -fL \
+    "https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie-downloader-linux-x86_64.tar.gz" \
     -o /tmp/pencarimovie.tar.gz \
     && tar -xzf /tmp/pencarimovie.tar.gz -C /app \
     && rm /tmp/pencarimovie.tar.gz \
@@ -28,7 +28,6 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\        \$configuredBotToken = trim((string) (\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\n        if (\$configuredBotToken !== '') {\n            \$botToken = \$configuredBotToken;\n        }" /app/backend.php
 
-# Keep the packaged storage location explicit for Render.
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
 EXPOSE 10000
