@@ -30,9 +30,9 @@ RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\     
 # Apply the stream-session/concurrency patch after the packaged backend is extracted.
 # The packaged runtime exposes PHP through FrankenPHP; invoke the script with
 # FrankenPHP's embedded PHP interpreter rather than assuming /app/bin/php exists.
-COPY patch-runtime.php /tmp/patch-runtime.php
-RUN /app/bin/frankenphp php-cli /tmp/patch-runtime.php \
-    && rm /tmp/patch-runtime.php
+# COPY patch-runtime.php /tmp/patch-runtime.php
+# RUN /app/bin/frankenphp php-cli /tmp/patch-runtime.php \
+    # && rm /tmp/patch-runtime.php
 
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
