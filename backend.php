@@ -135,7 +135,7 @@ define('FD_WP_VERSION_URL', FD_WP_API_BASE . '/version');
 define('FD_API_SECRET_PATH', fd_storage_path('storage/api_secret.key'));
 define('FD_BOT_ID_CACHE_PATH', fd_storage_path('storage/bot_id.txt'));
 define('FD_SESSION_META_PATH', fd_storage_path('storage/session_meta.json'));
-define('FD_STREAM_POOL_SIZE', 2);
+define('FD_STREAM_POOL_SIZE', 4);
 define('FD_STREAM_POOL_DIR', fd_storage_path('storage/stream-pool'));
 
 /**
@@ -869,7 +869,8 @@ function fd_boot_madeline(?string $botToken = null, array $overrides = [], ?stri
     fd_log('fd_boot_madeline entry', [
         'ob_level' => $bootObLevel,
         'bot_token_provided' => $botToken !== null && $botToken !== '',
-        'session_exists' => is_dir(FD_SESSION_PATH) || is_file(FD_SESSION_PATH),
+        'session_path' => $sessionPathOverride ?: FD_SESSION_PATH,
+        'session_exists' => is_dir($sessionPathOverride ?: FD_SESSION_PATH) || is_file($sessionPathOverride ?: FD_SESSION_PATH),
     ]);
 
     // Check if MadelineProto is already loaded (e.g., via routing-level pre-load).
@@ -4050,6 +4051,19 @@ if (str_starts_with($path, '/api/')) {
         // Use an independent session for every active stream.
 try {
     $streamSlot = fd_acquire_stream_slot();
+
+    // IMPORTANT: never reuse the same MadelineProto session file for two
+    // simultaneous HTTP streams. A unique session path prevents MadelineProto
+    // file locking from serialising the second stream behind the first.
+    $streamSlot['session'] = FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR
+        . 'active-' . $streamSlot['slot'] . '-' . getmypid() . '-' . bin2hex(random_bytes(8)) . '.madeline';
+
+    fd_log('stream slot acquired', [
+        'slot' => $streamSlot['slot'],
+        'session' => $streamSlot['session'],
+        'pid' => getmypid(),
+        'thread' => function_exists('frankenphp_get_worker_thread_id') ? frankenphp_get_worker_thread_id() : null,
+    ]);
 } catch (Throwable $slotError) {
     fd_log('no streaming slot available', ['error' => $slotError->getMessage()]);
     header('Retry-After: 3');
@@ -4058,7 +4072,25 @@ try {
 
 $madeline = null;
 try {
-    [$madeline, $error] = fd_boot_madeline(null, [], $streamSlot['session']);
+    if (empty($streamSlot['session'])) {
+        throw new RuntimeException('Stream slot did not provide a session path.');
+    }
+
+    $streamBotToken = trim((string) (getenv('PENCARIMOVIE_BOT_TOKEN')
+        ?: ($_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? $_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? '')));
+
+    fd_log('booting dedicated stream session', [
+        'slot' => $streamSlot['slot'],
+        'session' => $streamSlot['session'],
+        'exists' => is_dir($streamSlot['session']) || is_file($streamSlot['session']),
+        'bot_token_configured' => $streamBotToken !== '',
+    ]);
+
+    [$madeline, $error] = fd_boot_madeline(
+        $streamBotToken !== '' ? $streamBotToken : null,
+        [],
+        $streamSlot['session']
+    );
     if (!$madeline) {
         fd_log('stream session unavailable', ['slot' => $streamSlot['slot'], 'error' => $error]);
         fd_json(['ok' => 0, 'message' => $error ?: 'Streaming session is not initialized. Please reconnect the bot.'], 503);
@@ -4068,6 +4100,12 @@ try {
         fd_json(['ok' => 0, 'message' => 'MadelineProto downloadToBrowser() is not available.'], 501);
     }
 
+    if (function_exists('set_time_limit')) { @set_time_limit(0); }
+    if (!headers_sent()) {
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('X-Accel-Buffering: no');
+        header('X-Stream-Slot: ' . (string) $streamSlot['slot']);
+    }
     fd_log('starting concurrent downloadToBrowser', [
         'slot' => $streamSlot['slot'],
         'file_id' => $fileId,
@@ -4085,7 +4123,33 @@ try {
     return true;
 } finally {
     unset($madeline);
+    $activeSession = (string) ($streamSlot['session'] ?? '');
     fd_release_stream_slot($streamSlot);
+
+    // Remove only this request's temporary session. Do not touch the primary
+    // login session or another stream's session.
+    if ($activeSession !== '') {
+        try {
+            if (is_file($activeSession)) {
+                @unlink($activeSession);
+            } elseif (is_dir($activeSession)) {
+                $it = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($activeSession, RecursiveDirectoryIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::CHILD_FIRST
+                );
+                foreach ($it as $info) {
+                    $info->isDir() ? @rmdir($info->getRealPath()) : @unlink($info->getRealPath());
+                }
+                @rmdir($activeSession);
+            }
+        } catch (Throwable $cleanupError) {
+            fd_log('stream session cleanup failed', [
+                'slot' => $streamSlot['slot'] ?? null,
+                'session' => $activeSession,
+                'error' => $cleanupError->getMessage(),
+            ]);
+        }
+    }
 }
     }
 
