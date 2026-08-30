@@ -21,46 +21,125 @@ function patch_once(string &$code, string $search, string $replace, string $labe
 
 patch_once(
     $code,
-    "define('FD_STREAM_POOL_SIZE', 2);",
-    "define('FD_STREAM_POOL_SIZE', 4);",
+    <<<'SEARCH'
+define('FD_STREAM_POOL_SIZE', 2);
+SEARCH,
+    <<<'REPLACE'
+define('FD_STREAM_POOL_SIZE', 4);
+REPLACE,
     'stream pool size'
 );
 
-// Log the real session path selected by fd_boot_madeline(), not only the
-// shared main session path.
+// Log the actual session path selected by fd_boot_madeline().
 patch_once(
     $code,
-    "        'session_exists' => is_dir(FD_SESSION_PATH) || is_file(FD_SESSION_PATH),",
-    "        'session_path' => $sessionPathOverride ?: FD_SESSION_PATH,\n        'session_exists' => is_dir($sessionPathOverride ?: FD_SESSION_PATH) || is_file($sessionPathOverride ?: FD_SESSION_PATH),",
+    <<<'SEARCH'
+        'session_exists' => is_dir(FD_SESSION_PATH) || is_file(FD_SESSION_PATH),
+SEARCH,
+    <<<'REPLACE'
+        'session_path' => $sessionPathOverride ?: FD_SESSION_PATH,
+        'session_exists' => is_dir($sessionPathOverride ?: FD_SESSION_PATH) || is_file($sessionPathOverride ?: FD_SESSION_PATH),
+REPLACE,
     'actual session diagnostics'
 );
 
-// Each request keeps its slot lock, but uses a unique session filename so two
-// HTTP requests can never make MadelineProto open the same session at once.
-$slotNeedle = "    $streamSlot = fd_acquire_stream_slot();";
-$slotReplace = "    $streamSlot = fd_acquire_stream_slot();\n    $baseStreamSession = $streamSlot['session'];\n    $streamSlot['session'] = FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR\n        . 'active-' . $streamSlot['slot'] . '-' . getmypid() . '-' . bin2hex(random_bytes(8)) . '.madeline';";
-patch_once($code, $slotNeedle, $slotReplace, 'unique stream session path');
+// Give every active stream its own MadelineProto session path.
+patch_once(
+    $code,
+    <<<'SEARCH'
+    $streamSlot = fd_acquire_stream_slot();
+SEARCH,
+    <<<'REPLACE'
+    $streamSlot = fd_acquire_stream_slot();
+    $streamSlot['session'] = FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR
+        . 'active-' . $streamSlot['slot'] . '-' . getmypid() . '-' . bin2hex(random_bytes(8)) . '.madeline';
+REPLACE,
+    'unique stream session path'
+);
 
 patch_once(
     $code,
-    "    [$madeline, $error] = fd_boot_madeline(null, [], $streamSlot['session']);",
-    "    fd_log('stream slot acquired', [\n        'slot' => $streamSlot['slot'],\n        'session' => $streamSlot['session'],\n        'pid' => getmypid(),\n    ]);\n    fd_log('booting dedicated stream session', [\n        'slot' => $streamSlot['slot'],\n        'session' => $streamSlot['session'],\n        'exists' => is_dir($streamSlot['session']) || is_file($streamSlot['session']),\n    ]);\n    $streamBotToken = trim((string) (getenv('PENCARIMOVIE_BOT_TOKEN') ?: ($_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? $_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? '')));\n    [$madeline, $error] = fd_boot_madeline(\n        $streamBotToken !== '' ? $streamBotToken : null,\n        [],\n        $streamSlot['session']\n    );",
+    <<<'SEARCH'
+    [$madeline, $error] = fd_boot_madeline(null, [], $streamSlot['session']);
+SEARCH,
+    <<<'REPLACE'
+    fd_log('stream slot acquired', [
+        'slot' => $streamSlot['slot'],
+        'session' => $streamSlot['session'],
+        'pid' => getmypid(),
+    ]);
+    fd_log('booting dedicated stream session', [
+        'slot' => $streamSlot['slot'],
+        'session' => $streamSlot['session'],
+        'exists' => is_dir($streamSlot['session']) || is_file($streamSlot['session']),
+    ]);
+    $streamBotToken = trim((string) (getenv('PENCARIMOVIE_BOT_TOKEN') ?: ($_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? $_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? '')));
+    [$madeline, $error] = fd_boot_madeline(
+        $streamBotToken !== '' ? $streamBotToken : null,
+        [],
+        $streamSlot['session']
+    );
+REPLACE,
     'dedicated stream boot'
 );
 
 patch_once(
     $code,
-    "    fd_log('starting concurrent downloadToBrowser', [",
-    "    if (function_exists('set_time_limit')) { @set_time_limit(0); }\n    if (!headers_sent()) {\n        header('Cache-Control: no-store, no-cache, must-revalidate');\n        header('X-Accel-Buffering: no');\n        header('X-Stream-Slot: ' . (string) $streamSlot['slot']);\n    }\n    fd_log('starting concurrent downloadToBrowser', [",
+    <<<'SEARCH'
+    fd_log('starting concurrent downloadToBrowser', [
+SEARCH,
+    <<<'REPLACE'
+    if (function_exists('set_time_limit')) {
+        @set_time_limit(0);
+    }
+    if (!headers_sent()) {
+        header('Cache-Control: no-store, no-cache, must-revalidate');
+        header('X-Accel-Buffering: no');
+        header('X-Stream-Slot: ' . (string) $streamSlot['slot']);
+    }
+    fd_log('starting concurrent downloadToBrowser', [
+REPLACE,
     'stream response handling'
 );
 
-// Delete the unique request session after the stream ends. The slot lock is
-// released first only after MadelineProto is fully destroyed.
+// Delete the request-specific session only after MadelineProto is released.
 patch_once(
     $code,
-    "} finally {\n    unset($madeline);\n    fd_release_stream_slot($streamSlot);\n}",
-    "} finally {\n    unset($madeline);\n    $activeSession = (string) ($streamSlot['session'] ?? '');\n    fd_release_stream_slot($streamSlot);\n    if ($activeSession !== '') {\n        try {\n            if (is_file($activeSession)) {\n                @unlink($activeSession);\n            } elseif (is_dir($activeSession)) {\n                $it = new RecursiveIteratorIterator(\n                    new RecursiveDirectoryIterator($activeSession, RecursiveDirectoryIterator::SKIP_DOTS),\n                    RecursiveIteratorIterator::CHILD_FIRST\n                );\n                foreach ($it as $info) {\n                    $info->isDir() ? @rmdir($info->getRealPath()) : @unlink($info->getRealPath());\n                }\n                @rmdir($activeSession);\n            }\n        } catch (Throwable $cleanupError) {\n            fd_log('stream session cleanup failed', [\n                'slot' => $streamSlot['slot'] ?? null,\n                'session' => $activeSession,\n                'error' => $cleanupError->getMessage(),\n            ]);\n        }\n    }\n}",
+    <<<'SEARCH'
+} finally {
+    unset($madeline);
+    fd_release_stream_slot($streamSlot);
+}
+SEARCH,
+    <<<'REPLACE'
+} finally {
+    unset($madeline);
+    $activeSession = (string) ($streamSlot['session'] ?? '');
+    fd_release_stream_slot($streamSlot);
+    if ($activeSession !== '') {
+        try {
+            if (is_file($activeSession)) {
+                @unlink($activeSession);
+            } elseif (is_dir($activeSession)) {
+                $it = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator($activeSession, RecursiveDirectoryIterator::SKIP_DOTS),
+                    RecursiveIteratorIterator::CHILD_FIRST
+                );
+                foreach ($it as $info) {
+                    $info->isDir() ? @rmdir($info->getRealPath()) : @unlink($info->getRealPath());
+                }
+                @rmdir($activeSession);
+            }
+        } catch (Throwable $cleanupError) {
+            fd_log('stream session cleanup failed', [
+                'slot' => $streamSlot['slot'] ?? null,
+                'session' => $activeSession,
+                'error' => $cleanupError->getMessage(),
+            ]);
+        }
+    }
+}
+REPLACE,
     'stream session cleanup'
 );
 
