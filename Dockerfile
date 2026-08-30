@@ -22,14 +22,6 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
         printf '\nmax_execution_time = 0\n' >> /app/bin/php.ini; \
     fi
 
-# Apply the FrankenPHP/MadelineProto runtime patch deterministically after
-# extracting the packaged application. The patch disables the web self-
-# restart/IPC mode, makes stream sessions independent, and keeps stream
-# initialization lazy instead of doing it during dashboard login.
-COPY patch-runtime.php /tmp/patch-runtime.php
-RUN /app/bin/php /tmp/patch-runtime.php \
-    && rm /tmp/patch-runtime.php
-
 # Render provides the real bot token through PENCARIMOVIE_BOT_TOKEN.
 # The browser may still submit a token, but the hosted server-side token is
 # authoritative. The secret is never written into the image or frontend.
