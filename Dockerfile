@@ -28,22 +28,34 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\        \$configuredBotToken = trim((string) (\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\n        if (\$configuredBotToken !== '') {\n            \$botToken = \$configuredBotToken;\n        }" /app/backend.php
 
-# The packaged backend was originally forcing MadelineProto's web self-restart
-# mode on every request. That mode is intended to keep a single long-running
-# web bot alive, but it can serialize independent API constructors inside the
-# same FrankenPHP process. Our server already has its own stream-slot locking
-# and Render provides long-lived PHP requests, so disable that global self-
-# restart flag. This is the key concurrency fix: each stream slot can construct
-# its own MadelineProto session without waiting on the first stream's web lock.
+# MadelineProto's web self-restart/IPC mode must not be forced in FrankenPHP.
+# There are two assignments in the packaged backend: one at file startup and
+# another inside fd_boot_madeline(). Disable BOTH. Each request must construct
+# its own in-process API instance instead of waiting on a shared IPC server.
 RUN perl -0pi -e 's/if \(!isset\(\$_GET\['"'"'MadelineSelfRestart'"'"'\]\)\) \{\s*\$_GET\['"'"'MadelineSelfRestart'"'"'\] = '"'"'1'"'"';\s*\}/unset(\$_GET['"'"'MadelineSelfRestart'"'"']);/g; s/\$_GET\['"'"'MadelineSelfRestart'"'"'\] = '"'"'1'"'"';/unset(\$_GET['"'"'MadelineSelfRestart'"'"']);/g' /app/backend.php
+
+# Do not destroy the stream pool when the dashboard logs in. Active streams
+# have independent sessions and must survive a token refresh/login request.
+RUN perl -0pi -e 's/\n\s*fd_clear_stream_pool\(\);\n\s*fd_clear_session\(\);/\n        fd_clear_session();/s' /app/backend.php
+
+# Do not warm/create stream sessions during login. This avoids unnecessary
+# MadelineProto initialization and IPC contention. Stream sessions are created
+# lazily when /api/download actually receives a stream request.
+RUN perl -0pi -e 's/\n\s*\$pool = fd_warm_stream_pool\(\$botToken\);\n\s*fd_log\('\''stream pool warmup complete'\'', \$pool\);/\n            fd_log('\''stream pool warmup skipped; streams are lazy'\'', []);/s' /app/backend.php
+
+# The slot lock still limits the number of simultaneous streams, but every
+# active request receives its own unique MadelineProto session directory.
+# This prevents stream 2 from touching stream 1's session/IPC state.
+RUN perl -0pi -e 's/(\$streamSlot = fd_acquire_stream_slot\(\);)/$1\n    $streamSlot['"'"'session'"'"'] = FD_STREAM_POOL_DIR . DIRECTORY_SEPARATOR . '\''active-'\'' . $streamSlot['"'"'slot'"'"'] . '\''-'\'' . getmypid() . '\''-'\'' . bin2hex(random_bytes(6)) . '\''.madeline'\'';/s' /app/backend.php
 
 # Give every concurrent stream the server-side bot token if its dedicated
 # session needs to be initialized or repaired.
 RUN sed -i 's@\[\$madeline, \$error\] = fd_boot_madeline(null, \[\], \$streamSlot\['"'"'session'"'"'\]);@\$streamBotToken = trim((string) (getenv("PENCARIMOVIE_BOT_TOKEN") ?: (\$_SERVER["PENCARIMOVIE_BOT_TOKEN"] ?? \$_ENV["PENCARIMOVIE_BOT_TOKEN"] ?? "")));\n    fd_log("stream slot acquired", ["slot" => \$streamSlot["slot"], "session" => \$streamSlot["session"]]);\n    [\$madeline, \$error] = fd_boot_madeline(\$streamBotToken !== "" ? \$streamBotToken : null, [], \$streamSlot["session"]);@' /app/backend.php
 
-# Verify the source was patched during the image build. Fail the build rather
-# than silently deploying a backend that still forces MadelineSelfRestart.
-RUN ! grep -n "MadelineSelfRestart.*= '1'" /app/backend.php
+# Verify that the image will not force MadelineSelfRestart and that login no
+# longer performs the stream-pool warmup.
+RUN ! grep -n "MadelineSelfRestart.*= '1'" /app/backend.php \
+    && ! grep -n "fd_warm_stream_pool(\$botToken)" /app/backend.php
 
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
