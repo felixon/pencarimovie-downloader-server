@@ -28,6 +28,12 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\        \$configuredBotToken = trim((string) (\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\n        if (\$configuredBotToken !== '') {\n            \$botToken = \$configuredBotToken;\n        }" /app/backend.php
 
+# Each concurrent stream has its own MadelineProto session slot. If a slot's
+# session is missing/expired, give fd_boot_madeline() the server-side token so
+# that slot can automatically authenticate itself instead of returning the
+# misleading "streaming session unavailable / reconnect bot" error.
+RUN sed -i 's@\[\$madeline, \$error\] = fd_boot_madeline(null, \[\], \$streamSlot\['"'"'session'"'"'\]);@\$streamBotToken = trim((string) (getenv("PENCARIMOVIE_BOT_TOKEN") ?: (\$_SERVER["PENCARIMOVIE_BOT_TOKEN"] ?? \$_ENV["PENCARIMOVIE_BOT_TOKEN"] ?? "")));\n    [\$madeline, \$error] = fd_boot_madeline(\$streamBotToken !== "" ? \$streamBotToken : null, [], \$streamSlot["session"]);@' /app/backend.php
+
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
 EXPOSE 10000
