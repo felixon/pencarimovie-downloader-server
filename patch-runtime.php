@@ -11,18 +11,18 @@ if (!is_file($path)) {
 $code = (string) file_get_contents($path);
 $original = $code;
 
-// FrankenPHP is an HTTP worker. Do not let MadelineProto enable its web
-// self-restart/IPC mechanism. The packaged backend sets this in two places.
-$code = preg_replace(
-    '~if\s*\(!isset\(\$_GET\[\'MadelineSelfRestart\'\]\)\)\s*\{\s*\$_GET\[\'MadelineSelfRestart\'\]\s*=\s*\'1\';\s*\}~',
-    "unset(\$_GET['MadelineSelfRestart']);",
-    $code
-) ?? $code;
-$code = str_replace(
-    "\$_GET['MadelineSelfRestart'] = '1';",
-    "unset(\$_GET['MadelineSelfRestart']);",
-    $code
-);
+// FrankenPHP is an HTTP worker. Keep MadelineProto in the current PHP
+// process instead of asking it to create a separate IPC worker. Render's
+// FrankenPHP environment does not reliably support the MadelineProto IPC
+// bootstrap path during a web request, which causes the login UI to report
+// "We couldn't start the IPC server" before botLogin() can run.
+//
+// The backend already sets MadelineSelfRestart=1 before constructing API;
+// preserve that setting. Do NOT replace it with unset().
+if (!str_contains($code, "\$_GET['MadelineSelfRestart'] = '1';")) {
+    fwrite(STDERR, "MadelineSelfRestart assignment is missing from backend.php.\n");
+    exit(2);
+}
 
 // Login should not create/warm stream sessions. Apart from being unnecessary,
 // doing so starts multiple MadelineProto instances during one HTTP request.
@@ -57,27 +57,27 @@ $code = str_replace($oldBoot, $newBoot, $code);
 
 if ($code === $original) {
     fwrite(STDERR, "Runtime patch made no changes. Release layout may have changed.\n");
-    exit(2);
+    exit(3);
 }
 
 file_put_contents($path, $code, LOCK_EX);
 
 // Hard checks: fail the image build instead of deploying a broken patch.
-if (str_contains($code, "\$_GET['MadelineSelfRestart'] = '1';")) {
-    fwrite(STDERR, "MadelineSelfRestart assignment still present.\n");
-    exit(3);
+if (!str_contains($code, "\$_GET['MadelineSelfRestart'] = '1';")) {
+    fwrite(STDERR, "MadelineSelfRestart assignment was removed unexpectedly.\n");
+    exit(4);
 }
 if (str_contains($code, 'fd_warm_stream_pool($botToken)')) {
     fwrite(STDERR, "Stream pool warmup still present.\n");
-    exit(4);
+    exit(5);
 }
 if (str_contains($code, "fd_boot_madeline(null, [], \$streamSlot['session'])")) {
     fwrite(STDERR, "Stream boot still uses a null bot token.\n");
-    exit(5);
+    exit(6);
 }
 if (!str_contains($code, 'streamBotToken') || !str_contains($code, "active-' . \$streamSlot['slot']")) {
     fwrite(STDERR, "Concurrent stream patch was not installed.\n");
-    exit(6);
+    exit(7);
 }
 
 echo "Runtime patch applied successfully.\n";
