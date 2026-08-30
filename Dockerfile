@@ -12,7 +12,7 @@ RUN curl -fL \
     -o /tmp/pencarimovie.tar.gz \
     && tar -xzf /tmp/pencarimovie.tar.gz -C /app \
     && rm /tmp/pencarimovie.tar.gz \
-    && chmod +x /app/bin/frankenphp
+    && chmod +x /app/bin/frankenphp /app/bin/php
 
 # Long Telegram-backed streams must not be terminated by PHP's default
 # execution timeout.
@@ -26,6 +26,11 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # The browser may still submit a token, but the hosted server-side token is
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\$botToken = trim((string) (\$input\['bot_token'\] ?? ''));/a\        \$configuredBotToken = trim((string) (\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\n        if (\$configuredBotToken !== '') {\n            \$botToken = \$configuredBotToken;\n        }" /app/backend.php
+
+# Apply the stream-session/concurrency patch after the packaged backend is extracted.
+COPY patch-runtime.php /tmp/patch-runtime.php
+RUN /app/bin/php /tmp/patch-runtime.php \
+    && rm /tmp/patch-runtime.php
 
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
