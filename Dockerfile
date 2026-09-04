@@ -31,16 +31,15 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
         printf '\nmax_execution_time = 0\n' >> /app/bin/php.ini; \
     fi
 
+# Always load the Render compatibility shim before any PHP entrypoint runs.
+# This is more reliable than changing router.php/index.php because FrankenPHP
+# may dispatch extensionless API URLs without going through either file first.
+RUN printf '\nauto_prepend_file = /app/render-bootstrap.php\n' >> /app/bin/php.ini
+
 # Render provides the real bot token through PENCARIMOVIE_BOT_TOKEN.
 # The browser may still submit a token, but the hosted server-side token is
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\\$botToken = trim((string) (\\$input\\['bot_token'\\] ?? ''));/a\\        \\$configuredBotToken = trim((string) (\\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \\$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\\n        if (\\$configuredBotToken !== '') {\\n            \\$botToken = \\$configuredBotToken;\\n        }" /app/backend.php
-
-# Render terminates the public request before PHP, so REMOTE_ADDR is not
-# loopback. The upstream v1.1.0 application intentionally blocks non-local
-# API clients. Patch the existing locality function only for this explicitly
-# enabled, exact Render host; all other deployments retain the upstream check.
-RUN sed -i '/^function fd_is_local_request(): bool$/a\    $renderMode = trim((string) (getenv("PENCARIMOVIE_RENDER_MODE") ?: ($_SERVER["PENCARIMOVIE_RENDER_MODE"] ?? "")));\n    $renderHost = strtolower(trim((string) ($_SERVER["HTTP_HOST"] ?? "")));\n    $renderHost = preg_replace("/:\\\\d+$/", "", $renderHost) ?? $renderHost;\n    $publicHost = strtolower(trim((string) (getenv("PENCARIMOVIE_PUBLIC_HOST") ?: "pencarimovie-downloader.onrender.com")));\n    if ($renderMode === "1" && $renderHost === $publicHost) {\n        return true;\n    }' /app/backend.php
 
 ENV PENCARIMOVIE_RENDER_MODE=1
 ENV PENCARIMOVIE_PUBLIC_HOST=pencarimovie-downloader.onrender.com
