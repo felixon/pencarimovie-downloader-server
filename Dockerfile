@@ -6,19 +6,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates tar \
     && rm -rf /var/lib/apt/lists/*
 
-# Use the packaged PencariMovie runtime for FrankenPHP, PHP, and dependencies.
+# Use the official PencariMovie Server v1.1.0 Linux x86_64 release package.
+# The release contains the matching FrankenPHP runtime, PHP configuration,
+# dependencies, frontend, and application files.
+ARG PENCARIMOVIE_VERSION=v1.1.0
 RUN curl -fL \
-    "https://github.com/aiskendi/pencarimovie-downloader/releases/download/v1.0.1/pencarimovie-downloader-linux-x86_64.tar.gz" \
+    "https://github.com/aiskendi/pencarimovie-server/releases/download/${PENCARIMOVIE_VERSION}/pencarimovie-downloader-linux-x86_64.tar.gz" \
     -o /tmp/pencarimovie.tar.gz \
     && tar -xzf /tmp/pencarimovie.tar.gz -C /app \
     && rm /tmp/pencarimovie.tar.gz \
     && chmod +x /app/bin/frankenphp
 
-# IMPORTANT:
-# The packaged archive contains its own backend.php. Copy the repository's
-# backend.php over it so the concurrency/stream-session code in the repo is
-# actually used by the deployed service.
+# Keep the repository's server-side application changes while using the
+# official v1.1.0 runtime/package as the base.
 COPY backend.php /app/backend.php
+COPY index.php /app/index.php
+COPY router.php /app/router.php
+COPY public /app/public
 
 # Long Telegram-backed streams must not be terminated by PHP's default
 # execution timeout.
@@ -33,6 +37,12 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\\$botToken = trim((string) (\\$input\\['bot_token'\\] ?? ''));/a\\        \\$configuredBotToken = trim((string) (\\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \\$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\\n        if (\\$configuredBotToken !== '') {\\n            \\$botToken = \\$configuredBotToken;\\n        }" /app/backend.php
 
+# The upstream server assumes the browser is running on the same machine or
+# LAN as the server and therefore protects API routes using REMOTE_ADDR.
+# Render is a trusted public reverse-proxy deployment, so index.php enables a
+# narrowly-scoped hosted mode that makes the application see the proxied
+# browser request as local. The upstream security code itself is unchanged.
+ENV PENCARIMOVIE_RENDER_MODE=1
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
 EXPOSE 10000
