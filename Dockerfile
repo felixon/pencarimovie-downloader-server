@@ -22,6 +22,7 @@ RUN curl -fL \
 COPY backend.php /app/backend.php
 COPY index.php /app/index.php
 COPY router.php /app/router.php
+COPY render-bootstrap.php /app/render-bootstrap.php
 COPY public /app/public
 
 # Long Telegram-backed streams must not be terminated by PHP's default
@@ -37,12 +38,11 @@ RUN if grep -qE '^[;[:space:]]*max_execution_time[[:space:]]*=' /app/bin/php.ini
 # authoritative. The secret is never written into the image or frontend.
 RUN sed -i "/\\$botToken = trim((string) (\\$input\\['bot_token'\\] ?? ''));/a\\        \\$configuredBotToken = trim((string) (\\$_SERVER['PENCARIMOVIE_BOT_TOKEN'] ?? \\$_ENV['PENCARIMOVIE_BOT_TOKEN'] ?? ''));\\n        if (\\$configuredBotToken !== '') {\\n            \\$botToken = \\$configuredBotToken;\\n        }" /app/backend.php
 
-# The upstream server assumes the browser is running on the same machine or
-# LAN as the server and therefore protects API routes using REMOTE_ADDR.
-# Render is a trusted public reverse-proxy deployment, so index.php enables a
-# narrowly-scoped hosted mode that makes the application see the proxied
-# browser request as local. The upstream security code itself is unchanged.
+# Render is explicitly opted into because the upstream application is designed
+# for same-machine/LAN browser access and protects API routes by REMOTE_ADDR.
+# render-bootstrap.php only activates on an onrender.com/public configured host.
 ENV PENCARIMOVIE_RENDER_MODE=1
+ENV PENCARIMOVIE_PUBLIC_HOST=pencarimovie-downloader.onrender.com
 ENV PENCARIMOVIE_STORAGE_DIR=/app/storage
 
 EXPOSE 10000
