@@ -3,16 +3,11 @@
 declare(strict_types=1);
 
 /**
- * Render compatibility shim for the upstream PencariMovie server.
- *
- * The upstream API intentionally treats non-local requests as untrusted because
- * the original application is designed to run on the same machine/LAN as the
- * browser. Render terminates the public connection at its proxy before PHP sees
- * the request, so REMOTE_ADDR is not loopback even for the application's own UI.
- *
- * Only enable this behavior when the deployment explicitly opts into
- * PENCARIMOVIE_RENDER_MODE. The host check prevents accidentally enabling it in
- * another environment. This does not expose or alter the bot token.
+ * Render compatibility shim for the official PencariMovie v1.1.0 runtime.
+ * Render's public edge can add Cloudflare headers. The upstream application
+ * uses those headers to identify TryCloudflare tunnels, which would incorrectly
+ * classify a normal Render request as remote. Only enable this on this explicit
+ * Render deployment.
  */
 $renderMode = trim((string) (getenv('PENCARIMOVIE_RENDER_MODE') ?: ($_SERVER['PENCARIMOVIE_RENDER_MODE'] ?? '')));
 if ($renderMode !== '1') {
@@ -20,22 +15,22 @@ if ($renderMode !== '1') {
 }
 
 $host = strtolower(trim((string) ($_SERVER['HTTP_HOST'] ?? '')));
-$host = preg_replace('/:\\d+$/', '', $host) ?? $host;
+$host = preg_replace('/:\d+$/', '', $host) ?? $host;
 $configuredHost = strtolower(trim((string) (getenv('PENCARIMOVIE_PUBLIC_HOST') ?: 'pencarimovie-downloader.onrender.com')));
-
-$allowed = $host !== '' && (
-    $host === $configuredHost
-    || str_ends_with($host, '.onrender.com')
-);
-
-if (!$allowed) {
+if ($host !== $configuredHost && !str_ends_with($host, '.onrender.com')) {
     return;
 }
 
 $path = parse_url((string) ($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
-
-// The upstream local-only check is applied only to API requests. Keep normal
-// static pages and Nuvio routes untouched.
 if (str_starts_with($path, '/api/')) {
+    // Make the upstream local-request test pass for Render API calls.
     $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
+
+    // Render's edge may send these; the upstream code interprets them as a
+    // TryCloudflare tunnel and rejects the request before checking REMOTE_ADDR.
+    unset(
+        $_SERVER['HTTP_CF_CONNECTING_IP'],
+        $_SERVER['HTTP_CF_RAY'],
+        $_SERVER['HTTP_CF_VISITOR']
+    );
 }
